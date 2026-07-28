@@ -37,6 +37,56 @@ namespace CodexQuotaDesktop
 
     public static class CodexTaskReader
     {
+        private const string StatusSql = "with events as (select id, ts, feedback_log_body from logs where target='codex_app_server::outgoing_message' and (feedback_log_body like 'app-server event: turn/started %' or feedback_log_body like 'app-server event: turn/completed %' or feedback_log_body like 'app-server event: item/started %' or feedback_log_body like 'app-server event: thread/status/changed %' or feedback_log_body like 'app-server event: serverRequest/resolved %')) select current.id, current.ts, case when current.feedback_log_body like 'app-server event: turn/completed %' then 'idle' when current.feedback_log_body like 'app-server event: thread/status/changed %' and (select previous.feedback_log_body from events previous where previous.id < current.id order by previous.id desc limit 1) like 'app-server event: item/started %' then 'waiting' else 'running' end from events current order by current.id desc limit 1;";
+        private static CodexTaskSnapshot lastRemote;
+        private static DateTime lastRemoteSeen;
+
+        private sealed class RemoteConfig
+        {
+            public string Host;
+            public string User;
+            public int Port;
+
+            public static RemoteConfig Load()
+            {
+                try
+                {
+                    string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "remote.ini");
+                    if (!File.Exists(path)) return null;
+                    RemoteConfig config = new RemoteConfig { Port = 22 };
+                    foreach (string rawLine in File.ReadAllLines(path))
+                    {
+                        string line = rawLine.Trim();
+                        if (line.Length == 0 || line.StartsWith("#", StringComparison.Ordinal)) continue;
+                        int equals = line.IndexOf('=');
+                        if (equals <= 0) continue;
+                        string key = line.Substring(0, equals).Trim().ToLowerInvariant();
+                        string value = line.Substring(equals + 1).Trim();
+                        if (key == "host") config.Host = value;
+                        else if (key == "user") config.User = value;
+                        else if (key == "port")
+                        {
+                            int port;
+                            if (Int32.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out port)) config.Port = port;
+                        }
+                    }
+                    if (!IsSafeSshValue(config.Host) || !IsSafeSshValue(config.User) || config.Port < 1 || config.Port > 65535) return null;
+                    return config;
+                }
+                catch { return null; }
+            }
+        }
+
+        private static bool IsSafeSshValue(string value)
+        {
+            if (String.IsNullOrWhiteSpace(value) || value.StartsWith("-", StringComparison.Ordinal)) return false;
+            foreach (char c in value)
+            {
+                if (Char.IsWhiteSpace(c) || c == '"' || c == '\'') return false;
+            }
+            return true;
+        }
+
         private static string FindSqlite()
         {
             string bundled = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "sqlite3.exe");
@@ -45,17 +95,31 @@ namespace CodexQuotaDesktop
 
         public static CodexTaskSnapshot Read()
         {
-            CodexTaskSnapshot idle = new CodexTaskSnapshot { State = CodexTaskState.Idle };
+            CodexTaskSnapshot local = ReadLocal();
+            CodexTaskSnapshot remote = ReadRemote();
+            if (remote != null)
+            {
+                lastRemote = remote;
+                lastRemoteSeen = DateTime.Now;
+            }
+            else if (lastRemote != null && DateTime.Now - lastRemoteSeen <= TimeSpan.FromSeconds(10))
+            {
+                remote = lastRemote;
+            }
+            return Merge(local, remote);
+        }
+
+        private static CodexTaskSnapshot ReadLocal()
+        {
             try
             {
                 string profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
                 string database = Path.Combine(profile, ".codex", "logs_2.sqlite");
-                if (!File.Exists(database)) return idle;
+                if (!File.Exists(database)) return null;
 
-                const string sql = "with events as (select id, ts, feedback_log_body from logs where target='codex_app_server::outgoing_message' and (feedback_log_body like 'app-server event: turn/started %' or feedback_log_body like 'app-server event: turn/completed %' or feedback_log_body like 'app-server event: item/started %' or feedback_log_body like 'app-server event: thread/status/changed %' or feedback_log_body like 'app-server event: serverRequest/resolved %')) select current.id || '|' || current.ts || '|' || case when current.feedback_log_body like 'app-server event: turn/completed %' then 'idle' when current.feedback_log_body like 'app-server event: thread/status/changed %' and (select previous.feedback_log_body from events previous where previous.id < current.id order by previous.id desc limit 1) like 'app-server event: item/started %' then 'waiting' else 'running' end from events current order by current.id desc limit 1;";
                 ProcessStartInfo info = new ProcessStartInfo();
                 info.FileName = FindSqlite();
-                info.Arguments = "-readonly \"" + database.Replace("\"", "\"\"") + "\" \"" + sql.Replace("\"", "\"\"") + "\"";
+                info.Arguments = "-readonly \"" + database.Replace("\"", "\"\"") + "\" \"" + StatusSql.Replace("\"", "\"\"") + "\"";
                 info.UseShellExecute = false;
                 info.CreateNoWindow = true;
                 info.RedirectStandardOutput = true;
@@ -63,28 +127,97 @@ namespace CodexQuotaDesktop
 
                 using (Process process = Process.Start(info))
                 {
-                    string output = process.StandardOutput.ReadToEnd().Trim();
+                    Task<string> outputTask = process.StandardOutput.ReadToEndAsync();
+                    Task<string> errorTask = process.StandardError.ReadToEndAsync();
                     if (!process.WaitForExit(2500))
                     {
                         try { process.Kill(); } catch { }
-                        return idle;
+                        return null;
                     }
-                    string[] parts = output.Split('|');
-                    long id, unix;
-                    if (parts.Length != 3 ||
-                        !Int64.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out id) ||
-                        !Int64.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out unix)) return idle;
-
-                    DateTime eventAt = DateTimeOffset.FromUnixTimeSeconds(unix).LocalDateTime;
-                    CodexTaskState state = parts[2] == "waiting" ? CodexTaskState.WaitingForConfirmation : (parts[2] == "idle" ? CodexTaskState.Idle : CodexTaskState.Running);
-                    if (state == CodexTaskState.Running && DateTime.Now - eventAt > TimeSpan.FromHours(6)) state = CodexTaskState.Idle;
-                    return new CodexTaskSnapshot { State = state, EventId = id, EventAt = eventAt };
+                    return ParseSnapshot(outputTask.Result);
                 }
             }
-            catch { return idle; }
+            catch { return null; }
+        }
+
+        private static CodexTaskSnapshot ReadRemote()
+        {
+            RemoteConfig config = RemoteConfig.Load();
+            if (config == null) return null;
+            try
+            {
+                string encodedSql = Convert.ToBase64String(Encoding.UTF8.GetBytes(StatusSql));
+                string script =
+                    "import base64,os,sqlite3\n" +
+                    "p=os.path.expanduser('~/.codex/logs_2.sqlite')\n" +
+                    "q=base64.b64decode('" + encodedSql + "').decode('utf-8')\n" +
+                    "try:\n" +
+                    " c=sqlite3.connect('file:'+p+'?mode=ro',uri=True,timeout=2)\n" +
+                    " r=c.execute(q).fetchone()\n" +
+                    " print('|'.join(str(v) for v in r) if r else '0|0|idle')\n" +
+                    "except Exception:\n" +
+                    " print('ERROR')\n";
+
+                ProcessStartInfo info = new ProcessStartInfo();
+                info.FileName = "ssh.exe";
+                info.Arguments = "-o BatchMode=yes -o ConnectTimeout=4 -o ConnectionAttempts=1 -p " + config.Port.ToString(CultureInfo.InvariantCulture) + " " + config.User + "@" + config.Host + " python3 -";
+                info.UseShellExecute = false;
+                info.CreateNoWindow = true;
+                info.RedirectStandardInput = true;
+                info.RedirectStandardOutput = true;
+                info.RedirectStandardError = true;
+
+                using (Process process = Process.Start(info))
+                {
+                    Task<string> outputTask = process.StandardOutput.ReadToEndAsync();
+                    Task<string> errorTask = process.StandardError.ReadToEndAsync();
+                    process.StandardInput.Write(script);
+                    process.StandardInput.Close();
+                    if (!process.WaitForExit(7000))
+                    {
+                        try { process.Kill(); } catch { }
+                        return null;
+                    }
+                    return ParseSnapshot(outputTask.Result);
+                }
+            }
+            catch { return null; }
+        }
+
+        private static CodexTaskSnapshot ParseSnapshot(string output)
+        {
+            if (String.IsNullOrWhiteSpace(output)) return null;
+            string[] lines = output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            for (int index = lines.Length - 1; index >= 0; index--)
+            {
+                string[] parts = lines[index].Trim().Split('|');
+                long id, unix;
+                if (parts.Length != 3 ||
+                    !Int64.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out id) ||
+                    !Int64.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out unix)) continue;
+                CodexTaskState state = parts[2] == "waiting" ? CodexTaskState.WaitingForConfirmation : (parts[2] == "idle" ? CodexTaskState.Idle : CodexTaskState.Running);
+                DateTime eventAt = DateTimeOffset.FromUnixTimeSeconds(unix).LocalDateTime;
+                if (state == CodexTaskState.Running && DateTime.Now - eventAt > TimeSpan.FromHours(6)) state = CodexTaskState.Idle;
+                return new CodexTaskSnapshot { State = state, EventId = id, EventAt = eventAt };
+            }
+            return null;
+        }
+
+        private static CodexTaskSnapshot Merge(CodexTaskSnapshot local, CodexTaskSnapshot remote)
+        {
+            CodexTaskState state;
+            if ((local != null && local.State == CodexTaskState.WaitingForConfirmation) || (remote != null && remote.State == CodexTaskState.WaitingForConfirmation))
+                state = CodexTaskState.WaitingForConfirmation;
+            else if ((local != null && local.State == CodexTaskState.Running) || (remote != null && remote.State == CodexTaskState.Running))
+                state = CodexTaskState.Running;
+            else
+                state = CodexTaskState.Idle;
+            DateTime eventAt = DateTime.MinValue;
+            if (local != null && local.EventAt > eventAt) eventAt = local.EventAt;
+            if (remote != null && remote.EventAt > eventAt) eventAt = remote.EventAt;
+            return new CodexTaskSnapshot { State = state, EventAt = eventAt };
         }
     }
-
     public static class CodexReader
     {
         private static readonly JavaScriptSerializer Json = new JavaScriptSerializer();

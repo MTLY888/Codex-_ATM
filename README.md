@@ -45,3 +45,16 @@ cd Codex-_ATM
 - 用户设置会保存到本地 `settings.ini`，该文件不会提交到 Git。
 - 随项目提供的 SQLite 为 64 位 SQLite 3.45.3；SQLite 属于公有领域软件。
 - 本项目不会上传 Codex 登录凭据、额度数据或本地任务记录。
+## 远程服务器监控（可选）
+
+如需同时监控远程服务器，请在 `CodexQuota.exe` 同一目录新建 `remote.ini`：
+
+```ini
+Host=server.example.com
+User=username
+Port=22
+```
+
+远程服务器需安装 Python 3，且该用户的 `~/.codex/logs_2.sqlite` 可读。本机还需能通过 SSH 密钥免交互登录服务器。`remote.ini` 只保存在本机，不会提交到 Git。
+
+程序会合并本机与远程状态：任一端等待用户确认时亮绿灯；否则任一端正在运行时亮红灯；两端均无运行任务时亮黄灯。
