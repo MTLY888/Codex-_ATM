@@ -37,9 +37,38 @@ namespace CodexQuotaDesktop
 
     public static class CodexTaskReader
     {
-        private const string StatusSql = "with events as (select id, ts, feedback_log_body from logs where target='codex_app_server::outgoing_message' and (feedback_log_body like 'app-server event: turn/started %' or feedback_log_body like 'app-server event: turn/completed %' or feedback_log_body like 'app-server event: item/started %' or feedback_log_body like 'app-server event: thread/status/changed %' or feedback_log_body like 'app-server event: serverRequest/resolved %')) select current.id, current.ts, case when current.feedback_log_body like 'app-server event: turn/completed %' then 'idle' when current.feedback_log_body like 'app-server event: thread/status/changed %' and (select previous.feedback_log_body from events previous where previous.id < current.id order by previous.id desc limit 1) like 'app-server event: item/started %' then 'waiting' else 'running' end from events current order by current.id desc limit 1;";
+        private const string StatusSql =
+            "with events as (" +
+            "select id, ts, feedback_log_body from logs " +
+            "where id > (select coalesce(max(id),0)-50000 from logs) and target='codex_app_server::outgoing_message' and (" +
+            "feedback_log_body like 'app-server event: turn/started %' or " +
+            "feedback_log_body like 'app-server event: turn/completed %' or " +
+            "feedback_log_body like 'app-server event: item/started %' or " +
+            "feedback_log_body like 'app-server event: thread/status/changed %' or " +
+            "feedback_log_body like 'app-server event: serverRequest/resolved %' or " +
+            "feedback_log_body like '%item/commandExecution/requestApproval%' or " +
+            "feedback_log_body like '%item/fileChange/requestApproval%' or " +
+            "feedback_log_body like '%item/permissions/requestApproval%' or " +
+            "feedback_log_body like '%item/tool/requestUserInput%' or " +
+            "feedback_log_body like '%mcpServer/elicitation/request%'))," +
+            "markers as (" +
+            "select current.id, current.ts, case " +
+            "when current.feedback_log_body like '%item/commandExecution/requestApproval%' or " +
+            "current.feedback_log_body like '%item/fileChange/requestApproval%' or " +
+            "current.feedback_log_body like '%item/permissions/requestApproval%' or " +
+            "current.feedback_log_body like '%item/tool/requestUserInput%' or " +
+            "current.feedback_log_body like '%mcpServer/elicitation/request%' then 'waiting' " +
+            "when current.feedback_log_body like 'app-server event: turn/completed %' then 'idle' " +
+            "when current.feedback_log_body like 'app-server event: serverRequest/resolved %' then 'running' " +
+            "when current.feedback_log_body like 'app-server event: thread/status/changed %' and " +
+            "(select previous.feedback_log_body from events previous where previous.id < current.id order by previous.id desc limit 1) " +
+            "like 'app-server event: item/started %' then 'waiting' " +
+            "when current.feedback_log_body like 'app-server event: thread/status/changed %' then 'running' " +
+            "when current.feedback_log_body like 'app-server event: turn/started %' then 'running' " +
+            "else null end as state from events current) " +
+            "select id, ts, state from markers where state is not null order by id desc limit 1;";
         private static CodexTaskSnapshot lastRemote;
-        private static DateTime lastRemoteSeen;
+        private static string lastRemoteKey;
 
         private sealed class RemoteConfig
         {
@@ -96,14 +125,22 @@ namespace CodexQuotaDesktop
         public static CodexTaskSnapshot Read()
         {
             CodexTaskSnapshot local = ReadLocal();
-            CodexTaskSnapshot remote = ReadRemote();
+            RemoteConfig config = RemoteConfig.Load();
+            string remoteKey = config == null ? null : config.User + "@" + config.Host + ":" + config.Port.ToString(CultureInfo.InvariantCulture);
+            if (!String.Equals(remoteKey, lastRemoteKey, StringComparison.OrdinalIgnoreCase))
+            {
+                lastRemote = null;
+                lastRemoteKey = remoteKey;
+            }
+
+            CodexTaskSnapshot remote = ReadRemote(config);
             if (remote != null)
             {
                 lastRemote = remote;
-                lastRemoteSeen = DateTime.Now;
             }
-            else if (lastRemote != null && DateTime.Now - lastRemoteSeen <= TimeSpan.FromSeconds(10))
+            else if (config != null)
             {
+                // SSH 读取失败只代表状态未知，不能把它误判为任务已经结束。
                 remote = lastRemote;
             }
             return Merge(local, remote);
@@ -140,9 +177,8 @@ namespace CodexQuotaDesktop
             catch { return null; }
         }
 
-        private static CodexTaskSnapshot ReadRemote()
+        private static CodexTaskSnapshot ReadRemote(RemoteConfig config)
         {
-            RemoteConfig config = RemoteConfig.Load();
             if (config == null) return null;
             try
             {
