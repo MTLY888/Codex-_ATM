@@ -7,7 +7,7 @@
 1. 克隆仓库：
 
 ```powershell
-git clone git@github.com:MTLY888/Codex-_ATM.git
+git clone https://github.com/MTLY888/Codex-_ATM.git
 cd Codex-_ATM
 ```
 
